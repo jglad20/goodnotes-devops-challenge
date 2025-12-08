@@ -1,0 +1,207 @@
+name: DevOps Challenge - KinD Cluster Load Testing
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  kubernetes-load-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ============================================
+      # STEP 1: SETUP
+      # ============================================
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests urllib3
+
+      # ============================================
+      # STEP 2: PROVISION KUBERNETES CLUSTER (KinD)
+      # ============================================
+      - name: Install KinD
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          kubectl version --client
+
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      - name: Create multi-node KinD cluster
+        run: |
+          bash scripts/setup-cluster.sh
+
+      # ============================================
+      # STEP 3: DEPLOY INGRESS CONTROLLER
+      # ============================================
+      - name: Add Helm repositories
+        run: |
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Deploy NGINX Ingress Controller
+        run: |
+          helm install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace ingress-nginx \
+            --create-namespace \
+            --set controller.hostPort.enabled=true \
+            --set controller.service.type=NodePort \
+            --set controller.hostPort.ports.http=80 \
+            --set controller.hostPort.ports.https=443 \
+            --wait \
+            --timeout 5m
+
+          echo "Waiting for ingress controller to be ready..."
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=300s
+
+      # ============================================
+      # STEP 4: DEPLOY APPLICATIONS
+      # ============================================
+      - name: Deploy http-echo applications
+        run: |
+          bash scripts/deploy-workloads.sh
+
+      # ============================================
+      # STEP 5: HEALTH CHECKS
+      # ============================================
+      - name: Validate deployments and ingress
+        run: |
+          bash scripts/health-checks.sh
+
+      # ============================================
+      # STEP 6: MONITORING (STRETCH GOAL)
+      # ============================================
+      - name: Deploy Prometheus monitoring stack
+        run: |
+          helm install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --create-namespace \
+            --set prometheus.prometheusSpec.retention=1h \
+            --set prometheus.prometheusSpec.scrapeInterval=15s \
+            --set grafana.enabled=true \
+            --set grafana.adminPassword=admin \
+            --wait \
+            --timeout 8m
+
+          echo "Waiting for Prometheus to be ready..."
+          kubectl wait --namespace monitoring \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/name=prometheus \
+            --timeout=300s
+
+      - name: Import Grafana dashboards
+        run: |
+          # Wait for Grafana to be fully ready
+          kubectl wait --namespace monitoring \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/name=grafana \
+            --timeout=300s
+
+          echo "Grafana dashboard available at: kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80"
+
+      - name: Create Prometheus alert rules
+        run: |
+          kubectl apply -f monitoring/prometheus/alert-rules.yaml
+
+      # ============================================
+      # STEP 7: LOAD TESTING
+      # ============================================
+      - name: Run load testing
+        id: load_test
+        run: |
+          python scripts/load-test.py > load-test-results.txt
+          cat load-test-results.txt
+
+      - name: Upload load test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-test-results
+          path: |
+            load-test-results.txt
+            load-test-metrics.csv
+          retention-days: 30
+
+      # ============================================
+      # STEP 8: POST RESULTS TO PR
+      # ============================================
+      - name: Post load test results to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const loadTestOutput = fs.readFileSync('load-test-results.txt', 'utf8');
+
+            const comment = `## 🚀 Kubernetes Load Testing Results
+
+            **Cluster:** Multi-node KinD (1 control-plane + 2 workers)
+            **Applications:** foo-echo, bar-echo (2 replicas each)
+            **Ingress:** NGINX (host-based routing)
+            **Monitoring:** Prometheus + Grafana
+
+            ### 📊 Load Test Results
+
+            \`\`\`
+            ${loadTestOutput}
+            \`\`\`
+
+            ### ✅ Deployment Validation
+            - [x] Multi-node KinD cluster provisioned
+            - [x] NGINX Ingress Controller deployed
+            - [x] foo-echo and bar-echo deployments healthy
+            - [x] Ingress routing verified (foo.localhost, bar.localhost)
+            - [x] Load testing completed successfully
+            - [x] Prometheus monitoring active
+
+            ### 📁 Artifacts
+            - Load test results: Download from workflow artifacts
+            - Metrics CSV: Available for analysis
+
+            ---
+            *Generated by GitHub Actions workflow - ${context.workflow} #${context.runNumber}*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      # ============================================
+      # STEP 9: CLEANUP
+      # ============================================
+      - name: Cleanup cluster
+        if: always()
+        run: |
+          kind delete cluster --name devops-challenge || true

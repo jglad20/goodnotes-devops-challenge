@@ -1,0 +1,275 @@
+{
+  "dashboard": {
+    "title": "HTTP Echo Load Testing Dashboard",
+    "tags": ["load-testing", "http-echo", "kubernetes"],
+    "timezone": "browser",
+    "schemaVersion": 27,
+    "version": 1,
+    "refresh": "10s",
+    "time": {
+      "from": "now-15m",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "Request Rate (req/s)",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\"}[1m])) by (host)",
+            "legendFormat": "{{ host }}",
+            "refId": "A"
+          },
+          {
+            "expr": "sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\"}[1m]))",
+            "legendFormat": "Total",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {"format": "reqps", "label": "Requests/sec"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true, "alignAsTable": true, "avg": true, "current": true, "max": true}
+      },
+      {
+        "id": 2,
+        "title": "Response Time Distribution (Percentiles)",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, sum(rate(nginx_ingress_controller_request_duration_seconds_bucket{host=~\"(foo|bar)\\\\.localhost\"}[5m])) by (host, le))",
+            "legendFormat": "{{ host }} - p50",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.90, sum(rate(nginx_ingress_controller_request_duration_seconds_bucket{host=~\"(foo|bar)\\\\.localhost\"}[5m])) by (host, le))",
+            "legendFormat": "{{ host }} - p90",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(nginx_ingress_controller_request_duration_seconds_bucket{host=~\"(foo|bar)\\\\.localhost\"}[5m])) by (host, le))",
+            "legendFormat": "{{ host }} - p95",
+            "refId": "C"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(nginx_ingress_controller_request_duration_seconds_bucket{host=~\"(foo|bar)\\\\.localhost\"}[5m])) by (host, le))",
+            "legendFormat": "{{ host }} - p99",
+            "refId": "D"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Response Time"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true, "alignAsTable": true, "avg": true, "current": true}
+      },
+      {
+        "id": 3,
+        "title": "Error Rate (%)",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "(sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\", status=~\"5..\"}[5m])) by (host) / sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\"}[5m])) by (host)) * 100",
+            "legendFormat": "{{ host }} - 5xx",
+            "refId": "A"
+          },
+          {
+            "expr": "(sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\", status=~\"4..\"}[5m])) by (host) / sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\"}[5m])) by (host)) * 100",
+            "legendFormat": "{{ host }} - 4xx",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "label": "Error Rate", "max": 100, "min": 0},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [5], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "High Error Rate Alert",
+          "noDataState": "no_data"
+        }
+      },
+      {
+        "id": 4,
+        "title": "HTTP Status Codes Distribution",
+        "type": "piechart",
+        "gridPos": {"x": 12, "y": 8, "w": 6, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\"}[5m])) by (status)",
+            "legendFormat": "{{ status }}",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "legend": {"displayMode": "table", "placement": "right"},
+          "pieType": "pie",
+          "displayLabels": ["percent"],
+          "reduceOptions": {"values": false, "calcs": ["lastNotNull"]}
+        }
+      },
+      {
+        "id": 5,
+        "title": "Request Rate by Status Code",
+        "type": "stat",
+        "gridPos": {"x": 18, "y": 8, "w": 6, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\", status=\"200\"}[5m]))",
+            "legendFormat": "2xx Success",
+            "refId": "A"
+          },
+          {
+            "expr": "sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\", status=~\"4..\"}[5m]))",
+            "legendFormat": "4xx Client Error",
+            "refId": "B"
+          },
+          {
+            "expr": "sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\", status=~\"5..\"}[5m]))",
+            "legendFormat": "5xx Server Error",
+            "refId": "C"
+          }
+        ],
+        "options": {
+          "graphMode": "area",
+          "colorMode": "background",
+          "orientation": "auto",
+          "textMode": "value_and_name"
+        }
+      },
+      {
+        "id": 6,
+        "title": "Pod CPU Usage",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"default\", pod=~\"(foo|bar)-echo-.*\"}[5m])) by (pod) * 1000",
+            "legendFormat": "{{ pod }}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "CPU (millicores)"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Pod Memory Usage",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(container_memory_working_set_bytes{namespace=\"default\", pod=~\"(foo|bar)-echo-.*\"}) by (pod)",
+            "legendFormat": "{{ pod }}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "bytes", "label": "Memory"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Ingress Request Volume (Total)",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 24, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "sum(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\"})",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "graphMode": "area",
+          "colorMode": "value",
+          "textMode": "value_and_name"
+        }
+      },
+      {
+        "id": 9,
+        "title": "Active Pods",
+        "type": "stat",
+        "gridPos": {"x": 6, "y": 24, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "count(kube_pod_status_phase{namespace=\"default\", pod=~\"(foo|bar)-echo-.*\", phase=\"Running\"})",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "graphMode": "none",
+          "colorMode": "value",
+          "textMode": "value_and_name"
+        }
+      },
+      {
+        "id": 10,
+        "title": "Average Response Time (Last 5m)",
+        "type": "stat",
+        "gridPos": {"x": 12, "y": 24, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "avg(rate(nginx_ingress_controller_request_duration_seconds_sum{host=~\"(foo|bar)\\\\.localhost\"}[5m]) / rate(nginx_ingress_controller_request_duration_seconds_count{host=~\"(foo|bar)\\\\.localhost\"}[5m])) * 1000",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "graphMode": "area",
+          "colorMode": "value",
+          "textMode": "value_and_name",
+          "unit": "ms"
+        }
+      },
+      {
+        "id": 11,
+        "title": "Success Rate (%)",
+        "type": "gauge",
+        "gridPos": {"x": 18, "y": 24, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "(1 - (sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\", status=~\"5..\"}[5m])) / sum(rate(nginx_ingress_controller_requests{host=~\"(foo|bar)\\\\.localhost\"}[5m])))) * 100",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 95, "color": "yellow"},
+                {"value": 99, "color": "green"}
+              ]
+            }
+          }
+        }
+      }
+    ]
+  }
+}
