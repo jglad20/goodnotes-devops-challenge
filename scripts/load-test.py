@@ -17,34 +17,107 @@ import random
 import statistics
 import csv
 import sys
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from typing import List, Dict, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
-import urllib.request
-import urllib.error
 
 # ============================================
 # CONFIGURATION
 # ============================================
-# NOTE: I chose these values based on balancing thoroughness vs CI runtime.
-# In production, I'd parameterize these via environment variables.
-# 60 seconds is long enough to see patterns but short enough for PR feedback loops.
 HOSTS = ["foo.localhost", "bar.localhost"]
-BASE_URL = "http://localhost"
-DURATION_SECONDS = 60  # Considered 120s but GitHub Actions free tier has time limits
-CONCURRENT_USERS = 10   # Matches typical small-team concurrent access patterns
 
-# Why CSV over JSON? Easier to open in Excel for quick analysis,
-# and GitHub Actions artifact download preserves formatting better.
-CSV_OUTPUT_FILE = "load-test-metrics.csv"
+# Dynamically detect the ingress access method (hostPort vs NodePort vs env var)
+import os
+
+def get_base_url():
+    """
+    Detect the correct URL to access the ingress controller.
+    Priority: LOAD_TEST_URL env var > hostPort > NodePort > Docker network > cluster service
+    """
+    # Method 0: Use environment variable if provided (set by CI port-forward)
+    env_url = os.environ.get("LOAD_TEST_URL")
+    if env_url:
+        print(f"  → Using LOAD_TEST_URL from environment: {env_url}", file=sys.stderr)
+        return env_url
+
+    # Method 1: Try hostPort on localhost:80 (Docker Desktop / local KinD)
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "-H", "Host: foo.localhost", "http://localhost:80", "--max-time", "2"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.stdout.strip() in ["200", "404"]:
+            return "http://localhost:80"
+    except:
+        pass
+
+    # Method 2: Try NodePort (GitHub Actions without port-forward)
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "svc", "-n", "ingress-nginx", "ingress-nginx-controller",
+             "-o", "jsonpath={.spec.ports[?(@.name==\"http\")].nodePort}"],
+            capture_output=True, text=True, timeout=5
+        )
+        nodeport = result.stdout.strip()
+        if nodeport and nodeport.isdigit():
+            test_url = f"http://localhost:{nodeport}"
+            test_result = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-H", "Host: foo.localhost", test_url, "--max-time", "2"],
+                capture_output=True, text=True, timeout=3
+            )
+            if test_result.stdout.strip() in ["200", "404"]:
+                return test_url
+    except:
+        pass
+
+    # Method 3: Try via Docker network (KinD specific)
+    try:
+        # Use index 0 to get only the first network's IP (avoids concatenation issue)
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{(index .NetworkSettings.Networks (index (keys .NetworkSettings.Networks) 0)).IPAddress}}",
+             "devops-challenge-control-plane"],
+            capture_output=True, text=True, timeout=5
+        )
+        raw_ip = result.stdout.strip()
+        import re
+        # Validate it's a proper IP (each octet 0-255)
+        ip_match = re.match(r'^((?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d))$', raw_ip)
+        if ip_match:
+            control_plane_ip = ip_match.group(1)
+            # Validate connectivity before returning
+            test_url = f"http://{control_plane_ip}:80"
+            test_result = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-H", "Host: foo.localhost", test_url, "--max-time", "2"],
+                capture_output=True, text=True, timeout=3
+            )
+            if test_result.stdout.strip() in ["200", "404"]:
+                return test_url
+    except:
+        pass
+
+    # Method 4: Cluster-internal service (last resort)
+    return "http://ingress-nginx-controller.ingress-nginx.svc.cluster.local"
+
+BASE_URL = get_base_url()
+print(f"🌐 Using ingress URL: {BASE_URL}")
+
+DURATION_SECONDS = 60   # Long enough for patterns, short enough for CI feedback loops
+CONCURRENT_USERS = 10   # Simulates typical small-team concurrent access
+
+CSV_OUTPUT_FILE = "load-test-metrics.csv"  # CSV for easy Excel analysis of artifacts
 
 # ============================================
 # DATA STRUCTURES
 # ============================================
 @dataclass
 class LoadTestMetrics:
-    """Container for all load test metrics"""
+    """Container for all load test metrics with thread-safe operations"""
     request_count: int = 0
     success_count: int = 0
     failure_count: int = 0
@@ -69,43 +142,46 @@ class LoadTestMetrics:
         }
     })
     csv_rows: List[Dict] = field(default_factory=list)
+    _lock: Lock = field(default_factory=Lock)
 
     def add_result(self, host: str, success: bool, response_time: float, error_type: str = None):
-        """Record a single request result"""
-        self.request_count += 1
+        """Record a single request result (thread-safe)"""
         timestamp = datetime.now().isoformat()
 
-        if success:
-            self.success_count += 1
-            self.response_times.append(response_time)
-            self.host_metrics[host]["success"] += 1
-            self.host_metrics[host]["times"].append(response_time)
-            status = "success"
-        else:
-            self.failure_count += 1
-            self.host_metrics[host]["failure"] += 1
+        with self._lock:
+            self.request_count += 1
 
-            # Categorize failure type
-            if error_type == "timeout":
-                self.timeout_count += 1
-                self.host_metrics[host]["timeout"] += 1
-                status = "timeout"
-            elif error_type == "connection":
-                self.connection_error_count += 1
-                self.host_metrics[host]["connection_error"] += 1
-                status = "connection_error"
+            if success:
+                self.success_count += 1
+                self.response_times.append(response_time)
+                self.host_metrics[host]["success"] += 1
+                self.host_metrics[host]["times"].append(response_time)
+                status = "success"
             else:
-                self.other_error_count += 1
-                status = "other_error"
+                self.failure_count += 1
+                self.host_metrics[host]["failure"] += 1
 
-        # Record for CSV export
-        self.csv_rows.append({
-            "timestamp": timestamp,
-            "host": host,
-            "status": status,
-            "response_time_ms": round(response_time * 1000, 2) if success else None,
-            "error_type": error_type if not success else None
-        })
+                # Categorize failure type
+                if error_type == "timeout":
+                    self.timeout_count += 1
+                    self.host_metrics[host]["timeout"] += 1
+                    status = "timeout"
+                elif error_type == "connection":
+                    self.connection_error_count += 1
+                    self.host_metrics[host]["connection_error"] += 1
+                    status = "connection_error"
+                else:
+                    self.other_error_count += 1
+                    status = "other_error"
+
+            # Record for CSV export
+            self.csv_rows.append({
+                "timestamp": timestamp,
+                "host": host,
+                "status": status,
+                "response_time_ms": round(response_time * 1000, 2) if success else None,
+                "error_type": error_type if not success else None
+            })
 
     def calculate_percentile(self, percentile: float, data: List[float]) -> float:
         """Calculate percentile value from sorted data"""
@@ -211,32 +287,48 @@ KUBERNETES LOAD TESTING RESULTS
 # ============================================
 # REQUEST EXECUTION
 # ============================================
+_debug_lock = Lock()
+_debug_printed = False
+
 def make_request(host: str) -> Tuple[bool, float, str]:
     """
-    Execute a single HTTP request to the specified host
-
-    Returns:
-        Tuple of (success, response_time, error_type)
+    Execute a single HTTP request using curl (matches health-checks.sh approach).
+    This ensures consistent behavior between health checks and load testing.
     """
+    global _debug_printed
     start_time = time.time()
 
     try:
-        req = urllib.request.Request(BASE_URL, headers={"Host": host})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            response.read()
-            elapsed_time = time.time() - start_time
+        result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "-H", f"Host: {host}", BASE_URL, "--max-time", "5"],
+            capture_output=True, text=True, timeout=6
+        )
+        elapsed_time = time.time() - start_time
+        http_code = result.stdout.strip()
+
+        # Debug: print first response code to stderr (thread-safe)
+        with _debug_lock:
+            if not _debug_printed:
+                print(f"  → First curl response: http_code='{http_code}', stderr='{result.stderr.strip()[:100]}'", file=sys.stderr)
+                _debug_printed = True
+
+        # Accept any 2xx or 3xx response as success
+        if http_code.startswith("2") or http_code.startswith("3"):
             return (True, elapsed_time, None)
-
-    except urllib.error.URLError as e:
-        elapsed_time = time.time() - start_time
-        if isinstance(e.reason, TimeoutError) or "timed out" in str(e):
-            return (False, elapsed_time, "timeout")
-        else:
+        # Handle curl connection failures (http_code "000" or empty means network/DNS failure)
+        elif http_code == "000" or http_code == "":
             return (False, elapsed_time, "connection")
+        else:
+            return (False, elapsed_time, f"http_{http_code}")
 
-    except Exception as e:
+    except subprocess.TimeoutExpired:
         elapsed_time = time.time() - start_time
-        return (False, elapsed_time, "other")
+        return (False, elapsed_time, "timeout")
+
+    except Exception:
+        elapsed_time = time.time() - start_time
+        return (False, elapsed_time, "connection")
 
 
 def worker(worker_id: int, stop_time: float, metrics: LoadTestMetrics, progress_tracker: dict):
@@ -283,6 +375,154 @@ def print_progress(progress_tracker: dict, start_time: float, duration: int):
               f"Rate: {req_per_sec:.2f} req/s | "
               f"Remaining: {remaining}s",
               file=sys.stderr)
+
+
+# ============================================
+# RESOURCE UTILIZATION
+# ============================================
+def get_resource_utilization() -> Dict[str, Dict]:
+    """
+    Capture pod resource utilization using kubectl top.
+    Returns CPU and memory usage for foo-echo and bar-echo pods.
+    """
+    resource_data = {
+        "foo-echo": {"cpu": "N/A", "memory": "N/A", "pods": []},
+        "bar-echo": {"cpu": "N/A", "memory": "N/A", "pods": []}
+    }
+
+    try:
+        # Get pod metrics using kubectl top
+        result = subprocess.run(
+            ["kubectl", "top", "pods", "-l", "component=http-echo", "--no-headers"],
+            capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode == 0 and result.stdout.strip():
+            foo_cpu_total, foo_mem_total, foo_count = 0, 0, 0
+            bar_cpu_total, bar_mem_total, bar_count = 0, 0, 0
+
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split()
+                if len(parts) >= 3:
+                    pod_name = parts[0]
+                    cpu = parts[1]  # e.g., "45m"
+                    memory = parts[2]  # e.g., "52Mi"
+
+                    # Parse CPU (convert to millicores)
+                    cpu_value = int(cpu.replace('m', '')) if 'm' in cpu else int(cpu) * 1000
+
+                    # Parse memory (convert to Mi)
+                    if 'Mi' in memory:
+                        mem_value = int(memory.replace('Mi', ''))
+                    elif 'Gi' in memory:
+                        mem_value = int(memory.replace('Gi', '')) * 1024
+                    elif 'Ki' in memory:
+                        mem_value = int(memory.replace('Ki', '')) // 1024
+                    else:
+                        mem_value = 0
+
+                    if 'foo-echo' in pod_name:
+                        foo_cpu_total += cpu_value
+                        foo_mem_total += mem_value
+                        foo_count += 1
+                        resource_data["foo-echo"]["pods"].append({
+                            "name": pod_name, "cpu": cpu, "memory": memory
+                        })
+                    elif 'bar-echo' in pod_name:
+                        bar_cpu_total += cpu_value
+                        bar_mem_total += mem_value
+                        bar_count += 1
+                        resource_data["bar-echo"]["pods"].append({
+                            "name": pod_name, "cpu": cpu, "memory": memory
+                        })
+
+            # Calculate averages
+            if foo_count > 0:
+                resource_data["foo-echo"]["cpu"] = f"{foo_cpu_total // foo_count}m"
+                resource_data["foo-echo"]["memory"] = f"{foo_mem_total // foo_count}Mi"
+            if bar_count > 0:
+                resource_data["bar-echo"]["cpu"] = f"{bar_cpu_total // bar_count}m"
+                resource_data["bar-echo"]["memory"] = f"{bar_mem_total // bar_count}Mi"
+
+    except subprocess.TimeoutExpired:
+        print("  ⚠️ kubectl top timed out (metrics-server may not be ready)", file=sys.stderr)
+    except Exception as e:
+        print(f"  ⚠️ Could not get resource metrics: {e}", file=sys.stderr)
+
+    return resource_data
+
+
+def get_resource_limits() -> Dict[str, Dict]:
+    """Get configured resource limits for pods."""
+    limits = {
+        "foo-echo": {"cpu_limit": "200m", "memory_limit": "128Mi"},
+        "bar-echo": {"cpu_limit": "200m", "memory_limit": "128Mi"}
+    }
+
+    try:
+        for deployment in ["foo-echo", "bar-echo"]:
+            result = subprocess.run(
+                ["kubectl", "get", "deployment", deployment, "-o",
+                 "jsonpath={.spec.template.spec.containers[0].resources.limits.cpu},{.spec.template.spec.containers[0].resources.limits.memory}"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split(',')
+                if len(parts) == 2:
+                    limits[deployment]["cpu_limit"] = parts[0]
+                    limits[deployment]["memory_limit"] = parts[1]
+    except Exception:
+        pass  # Use defaults
+
+    return limits
+
+
+def format_resource_report(resources: Dict, limits: Dict) -> str:
+    """Format resource utilization as part of the report."""
+    report = f"""
+📈 RESOURCE UTILIZATION (during load test)
+{'─'*60}
+"""
+    for deployment in ["foo-echo", "bar-echo"]:
+        cpu_usage = resources[deployment]["cpu"]
+        mem_usage = resources[deployment]["memory"]
+        cpu_limit = limits[deployment]["cpu_limit"]
+        mem_limit = limits[deployment]["memory_limit"]
+
+        # Calculate percentages if we have valid data
+        cpu_pct = "N/A"
+        mem_pct = "N/A"
+
+        if cpu_usage != "N/A" and 'm' in cpu_usage and 'm' in cpu_limit:
+            try:
+                cpu_val = int(cpu_usage.replace('m', ''))
+                cpu_lim = int(cpu_limit.replace('m', ''))
+                if cpu_lim > 0:
+                    cpu_pct = f"{(cpu_val / cpu_lim * 100):.1f}%"
+            except ValueError:
+                pass
+
+        if mem_usage != "N/A" and 'Mi' in mem_usage and 'Mi' in mem_limit:
+            try:
+                mem_val = int(mem_usage.replace('Mi', ''))
+                mem_lim = int(mem_limit.replace('Mi', ''))
+                if mem_lim > 0:
+                    mem_pct = f"{(mem_val / mem_lim * 100):.1f}%"
+            except ValueError:
+                pass
+
+        report += f"""
+  {deployment}:
+    CPU:     {cpu_usage} / {cpu_limit} ({cpu_pct})
+    Memory:  {mem_usage} / {mem_limit} ({mem_pct})
+"""
+        # Show per-pod breakdown if available
+        if resources[deployment]["pods"]:
+            report += "    Pods:\n"
+            for pod in resources[deployment]["pods"]:
+                report += f"      - {pod['name']}: CPU={pod['cpu']}, Mem={pod['memory']}\n"
+
+    return report
 
 
 # ============================================
@@ -336,11 +576,18 @@ Configuration:
     print("🏁 Load testing completed!", file=sys.stderr)
     print(f"{'='*60}\n", file=sys.stderr)
 
+    # Capture resource utilization (stretch goal)
+    print("📊 Capturing resource utilization metrics...", file=sys.stderr)
+    resources = get_resource_utilization()
+    limits = get_resource_limits()
+    resource_report = format_resource_report(resources, limits)
+
     # Export CSV
     metrics.export_csv(CSV_OUTPUT_FILE)
 
-    # Print summary to stdout
+    # Print summary to stdout (includes resource utilization)
     print(metrics.get_summary())
+    print(resource_report)
 
 
 if __name__ == "__main__":
