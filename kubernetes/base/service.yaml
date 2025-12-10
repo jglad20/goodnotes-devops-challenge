@@ -1,18 +1,16 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: foo-echo-service
-  namespace: default
+  name: http-echo-service
   labels:
-    app: foo-echo
+    app: http-echo
     component: http-echo
 spec:
   type: ClusterIP
   selector:
-    app: foo-echo
+    app: http-echo
   ports:
     - name: http
       port: 80
       targetPort: 8080
       protocol: TCP
-  sessionAffinity: None

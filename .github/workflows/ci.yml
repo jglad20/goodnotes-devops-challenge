@@ -133,14 +133,53 @@ jobs:
         run: |
           kubectl apply -f monitoring/prometheus/alert-rules.yaml
 
+      - name: Deploy Metrics Server for resource utilization
+        continue-on-error: true
+        run: |
+          # Deploy metrics-server for kubectl top support
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+          # Patch for KinD (disable TLS verification for kubelet)
+          kubectl patch deployment metrics-server -n kube-system \
+            --type='json' \
+            -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+
+          # Wait for patched deployment to rollout
+          echo "Waiting for metrics-server rollout..."
+          kubectl rollout status deployment/metrics-server -n kube-system --timeout=90s || true
+
+          # Give metrics time to collect initial data
+          echo "Waiting 30 seconds for metrics collection..."
+          sleep 30
+
+          # Verify metrics-server is working (optional check)
+          kubectl top nodes || echo "⚠️ Metrics not yet available (this is optional)"
+
       # ============================================
       # STEP 7: LOAD TESTING
       # ============================================
       - name: Run load testing
         id: load_test
         run: |
-          python scripts/load-test.py > load-test-results.txt
+          # Start port-forward to ingress controller in background
+          # This exposes the ingress service to localhost:8080 for the load test
+          kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80 &
+          PORT_FORWARD_PID=$!
+          sleep 3  # Wait for port-forward to establish
+
+          # Verify port-forward is working
+          if curl -s -o /dev/null -w "%{http_code}" -H "Host: foo.localhost" http://localhost:8080 --max-time 5 | grep -q "200"; then
+            echo "✅ Port-forward established successfully"
+          else
+            echo "⚠️ Port-forward check returned non-200, but continuing..."
+          fi
+
+          # Run load test with port-forward URL
+          LOAD_TEST_URL="http://localhost:8080" python scripts/load-test.py > load-test-results.txt
           cat load-test-results.txt
+
+          # Cleanup port-forward
+          kill $PORT_FORWARD_PID 2>/dev/null || true
 
       - name: Upload load test results
         uses: actions/upload-artifact@v4

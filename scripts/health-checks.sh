@@ -49,8 +49,42 @@ test_ingress() {
   echo ""
   echo "Testing ingress route: $host"
 
-  # Test with curl
-  response=$(curl -s -H "Host: $host" http://localhost --max-time 5 || echo "FAILED")
+  local response=""
+
+  # Method 1: Try hostPort (works on Docker Desktop / local KinD)
+  response=$(curl -s -H "Host: $host" http://localhost:80 --max-time 3 2>/dev/null || echo "")
+
+  # Method 2: If hostPort failed, try NodePort (GitHub Actions)
+  if [ -z "$response" ] || [[ "$response" == *"Connection refused"* ]]; then
+    local nodeport=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}')
+    if [ -n "$nodeport" ]; then
+      echo "  → Trying NodePort :$nodeport"
+      response=$(curl -s -H "Host: $host" http://localhost:$nodeport --max-time 3 2>/dev/null || echo "")
+    fi
+  fi
+
+  # Method 3: Try via Docker network (KinD specific)
+  if [ -z "$response" ] || [[ "$response" == *"Connection refused"* ]]; then
+    # Use Go template index to get only the first network's IP (avoids concatenation issue)
+    local control_plane_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks (index (keys .NetworkSettings.Networks) 0)).IPAddress}}' devops-challenge-control-plane 2>/dev/null || echo "")
+    if [ -n "$control_plane_ip" ]; then
+      echo "  → Trying control plane IP: $control_plane_ip"
+      response=$(curl -s -H "Host: $host" http://$control_plane_ip:80 --max-time 3 2>/dev/null || echo "")
+    fi
+  fi
+
+  # Method 4: As last resort, test from inside the cluster using a test pod
+  if [ -z "$response" ] || [[ "$response" == *"Connection refused"* ]] || [[ "$response" == "FAILED" ]]; then
+    echo "  → Trying from inside cluster (test pod)"
+    # Create a temporary test pod with unique name to avoid conflicts
+    local pod_name="curl-test-${host//./-}-$$"
+    # Note: kubectl run --rm outputs "pod deleted" message, so we filter it out with grep -v
+    kubectl run "$pod_name" --image=curlimages/curl:latest --rm -i --restart=Never --pod-running-timeout=30s -- \
+      curl -s -H "Host: $host" http://ingress-nginx-controller.ingress-nginx.svc.cluster.local --max-time 5 2>/dev/null \
+      | grep -v "^pod.*deleted" > /tmp/ingress-test-$host.txt || true
+    response=$(cat /tmp/ingress-test-$host.txt 2>/dev/null || echo "FAILED")
+    rm -f /tmp/ingress-test-$host.txt
+  fi
 
   if [[ "$response" == *"$expected_text"* ]]; then
     echo "✅ $host → Response: $response"
@@ -87,8 +121,9 @@ fi
 echo ""
 echo "4. Testing Ingress Routing..."
 echo "----------------------------"
-# Give ingress a moment to fully propagate
-sleep 5
+# Give ingress more time to fully propagate (especially in CI environments)
+echo "Waiting 10 seconds for ingress rules to propagate..."
+sleep 10
 
 test_ingress "foo.localhost" "foo" || FAILED=1
 test_ingress "bar.localhost" "bar" || FAILED=1
